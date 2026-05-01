@@ -20,6 +20,9 @@ COPY requirements.txt .
 RUN python3 -m pip install --no-cache-dir --no-build-isolation basicsr \
  && python3 -m pip install --no-cache-dir -r requirements.txt
 
+# Copy model files to /models directory
+COPY models/ /models/
+
 # Application code
 COPY . .
 
