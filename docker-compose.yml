@@ -1,0 +1,24 @@
+services:
+  worker:
+    build: .
+    env_file: .env
+    volumes:
+      - ./models:/models:ro
+    environment:
+      # S3
+      - S3_BUCKET=${S3_BUCKET}
+      - S3_REGION=${S3_REGION:-us-east-1}
+      - S3_ENDPOINT_URL=${S3_ENDPOINT_URL}
+      - S3_KEY_PREFIX=${S3_KEY_PREFIX:-upscaled/}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      # Database
+      - ENABLE_DATABASE=${ENABLE_DATABASE:-false}
+      - DATABASE_URL=${DATABASE_URL}
+      # Webhook
+      - WEBHOOK_CALLBACK_URL=${WEBHOOK_CALLBACK_URL}
+      - WEBHOOK_TIMEOUT_SECONDS=${WEBHOOK_TIMEOUT_SECONDS:-10}
+      - WEBHOOK_AUTH_TOKEN=${WEBHOOK_AUTH_TOKEN}
+      # Models
+      - MODEL_2X_PATH=${MODEL_2X_PATH:-/models/RealESRGAN_x2plus.pth}
+      - MODEL_4X_PATH=${MODEL_4X_PATH:-/models/RealESRGAN_x4plus.pth}

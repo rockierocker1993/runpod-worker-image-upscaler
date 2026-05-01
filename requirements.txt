@@ -1,0 +1,20 @@
+# RunPod serverless
+runpod
+
+# Image processing
+Pillow
+numpy<2.0.0
+# basicsr is installed separately in Dockerfile with --no-build-isolation
+# to avoid CUDA version conflicts in setup_requires
+basicsr
+realesrgan
+
+# AWS S3
+boto3
+
+# HTTP
+requests
+
+# Database
+sqlalchemy
+psycopg2-binary
