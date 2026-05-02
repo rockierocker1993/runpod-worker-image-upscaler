@@ -9,12 +9,10 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 import runpod
-import numpy as np
 import requests
 from PIL import Image
-from basicsr.archs.rrdbnet_arch import RRDBNet
-from realesrgan import RealESRGANer
 from db import save_upscaled_image
+from upscaler import ImageUpscaler
 
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO").upper(),
@@ -30,6 +28,7 @@ S3_BUCKET = os.environ["S3_BUCKET"]
 S3_REGION = os.environ.get("S3_REGION", "us-east-1")
 S3_KEY_PREFIX = os.environ.get("S3_KEY_PREFIX", "upscaled/")
 S3_ENDPOINT_URL = os.environ.get("S3_ENDPOINT_URL")
+DELETE_INPUT_AFTER_UPSCALE = os.environ.get("DELETE_INPUT_AFTER_UPSCALE", "false")
 WEBHOOK_CALLBACK_URL = os.environ.get("WEBHOOK_CALLBACK_URL")
 WEBHOOK_TIMEOUT_SECONDS = float(os.environ.get("WEBHOOK_TIMEOUT_SECONDS", "10"))
 WEBHOOK_AUTH_TOKEN = os.environ.get("WEBHOOK_AUTH_TOKEN")
@@ -58,22 +57,58 @@ def _build_object_url(object_key: str) -> str:
     return f"https://{S3_BUCKET}.s3.{S3_REGION}.amazonaws.com/{object_key}"
 
 
-def _upload_to_s3(image: Image.Image, key_prefix: str) -> str:
-    """Upload a PIL image as PNG to S3 and return its public URL."""
+def _upload_to_s3(image: Image.Image, key_prefix: str, output_format: str = "png", output_quality: int = 95) -> tuple[str, str]:
+    """Upload a PIL image to S3 and return its public URL and format.
+    
+    Args:
+        image: PIL Image to upload
+        key_prefix: S3 key prefix
+        output_format: Output format (png, jpg, webp)
+        output_quality: Quality for lossy formats (1-100)
+    
+    Returns:
+        Tuple of (url, format)
+    """
     buffer = io.BytesIO()
-    image.save(buffer, format="PNG")
+    
+    # Normalize format
+    fmt = output_format.lower()
+    if fmt == "jpg":
+        fmt = "jpeg"
+    
+    # Save with appropriate settings
+    if fmt in ["jpeg", "webp"]:
+        # Convert RGBA to RGB for formats that don't support transparency
+        if image.mode in ("RGBA", "LA", "P"):
+            background = Image.new("RGB", image.size, (255, 255, 255))
+            if image.mode == "P":
+                image = image.convert("RGBA")
+            background.paste(image, mask=image.split()[-1] if image.mode in ("RGBA", "LA") else None)
+            image = background
+        image.save(buffer, format=fmt.upper(), quality=output_quality, optimize=True)
+    else:
+        # PNG or other lossless formats
+        image.save(buffer, format="PNG", optimize=True)
+        fmt = "png"
+    
     buffer.seek(0)
-
-    object_key = f"{key_prefix}{uuid.uuid4().hex}.png"
+    
+    # Determine file extension and content type
+    ext_map = {"jpeg": "jpg", "png": "png", "webp": "webp"}
+    content_type_map = {"jpeg": "image/jpeg", "png": "image/png", "webp": "image/webp"}
+    
+    ext = ext_map.get(fmt, "png")
+    content_type = content_type_map.get(fmt, "image/png")
+    object_key = f"{key_prefix}{uuid.uuid4().hex}.{ext}"
 
     _s3_client.upload_fileobj(
         buffer,
         S3_BUCKET,
         object_key,
-        ExtraArgs={"ContentType": "image/png"},
+        ExtraArgs={"ContentType": content_type},
     )
 
-    return _build_object_url(object_key)
+    return _build_object_url(object_key), ext
 
 
 def _download_image_from_s3(object_key: str) -> tuple[Image.Image, str]:
@@ -82,6 +117,12 @@ def _download_image_from_s3(object_key: str) -> tuple[Image.Image, str]:
     payload = response["Body"].read()
     image = Image.open(io.BytesIO(payload)).convert("RGB")
     return image, _build_object_url(object_key)
+
+
+def _delete_from_s3(object_key: str) -> None:
+    """Delete object from S3 bucket."""
+    _s3_client.delete_object(Bucket=S3_BUCKET, Key=object_key)
+    logger.info("Deleted S3 object: %s", object_key)
 
 
 def _send_webhook_callback(payload: dict) -> None:
@@ -155,57 +196,13 @@ def _to_bool(value: object) -> bool:
         return False
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
+
 # ---------------------------------------------------------------------------
-# Model configuration
+# Initialize upscaler
 # ---------------------------------------------------------------------------
 
-MODEL_CONFIGS = {
-    2: {
-        "name": "RealESRGAN_x2plus",
-        "path": os.environ.get("MODEL_2X_PATH", "/models/RealESRGAN_x2plus.pth"),
-        "num_block": 23,
-    },
-    4: {
-        "name": "RealESRGAN_x4plus",
-        "path": os.environ.get("MODEL_4X_PATH", "/models/RealESRGAN_x4plus.pth"),
-        "num_block": 23,
-    },
-}
-
-_upsampler_cache: dict = {}
-
-
-def _get_upsampler(scale: int) -> RealESRGANer:
-    """Return a cached RealESRGANer instance for the requested scale."""
-    if scale not in MODEL_CONFIGS:
-        raise ValueError(f"Unsupported scale factor: {scale}. Supported: {list(MODEL_CONFIGS.keys())}")
-
-    if scale not in _upsampler_cache:
-        cfg = MODEL_CONFIGS[scale]
-        if not os.path.exists(cfg["path"]):
-            raise FileNotFoundError(f"Model file not found: {cfg['path']}")
-
-        model = RRDBNet(
-            num_in_ch=3,
-            num_out_ch=3,
-            num_feat=64,
-            num_block=cfg["num_block"],
-            num_grow_ch=32,
-            scale=scale,
-        )
-
-        _upsampler_cache[scale] = RealESRGANer(
-            scale=scale,
-            model_path=cfg["path"],
-            model=model,
-            tile=0,
-            tile_pad=10,
-            pre_pad=0,
-            half=False,
-        )
-        logger.info("Loaded model for scale %sx", scale)
-
-    return _upsampler_cache[scale]
+# Initialize upscaler (singleton, lazy-loads models on first use)
+_upscaler = ImageUpscaler()
 
 
 # ---------------------------------------------------------------------------
@@ -217,33 +214,59 @@ def handler(job: dict) -> dict:
     start_time = time.perf_counter()
     job_input: dict = job.get("input", {})
     runpod_job_id: str | None = job.get("id")
-    job_properties: dict = job_input.get("properties", {})
-    db_enabled: bool = _to_bool(job_properties.get("enable_database", ENABLE_DATABASE))
+    db_enabled: bool = _to_bool(ENABLE_DATABASE)
 
     # --- Validate input ---
-    image_key: str | None = job_input.get("image_key")
+    image_key: str | None = job_input.get("image")
     if not image_key:
-        logger.warning("Job %s rejected: missing image_key", runpod_job_id)
+        logger.warning("Job %s rejected: missing image", runpod_job_id)
         return _build_final_response(
             {
                 "job_id": runpod_job_id,
-                "error": "Missing required field: image_key",
+                "error": "Missing required field: image",
             },
             status="error",
         )
 
     scale: int = int(job_input.get("scale", 4))
-    if scale not in MODEL_CONFIGS:
+    if scale not in ImageUpscaler.MODEL_CONFIGS:
         logger.warning("Job %s rejected: unsupported scale=%s", runpod_job_id, scale)
         return _build_final_response(
             {
                 "job_id": runpod_job_id,
-                "error": f"Unsupported scale: {scale}. Must be one of {list(MODEL_CONFIGS.keys())}",
+                "error": f"Unsupported scale: {scale}. Must be one of {list(ImageUpscaler.MODEL_CONFIGS.keys())}",
             },
             status="error",
         )
 
-    logger.info("Job %s started | scale=%s | image_key=%s", runpod_job_id, scale, image_key)
+    # Output format settings
+    output_format: str = job_input.get("output_format", "png").lower()
+    output_quality: int = int(job_input.get("output_quality", 95))
+    
+    # Validate output format
+    valid_formats = ["png", "jpg", "jpeg", "webp"]
+    if output_format not in valid_formats:
+        logger.warning("Job %s rejected: unsupported output_format=%s", runpod_job_id, output_format)
+        return _build_final_response(
+            {
+                "job_id": runpod_job_id,
+                "error": f"Unsupported output_format: {output_format}. Must be one of {valid_formats}",
+            },
+            status="error",
+        )
+    
+    # Validate quality
+    if not (1 <= output_quality <= 100):
+        logger.warning("Job %s rejected: invalid output_quality=%s", runpod_job_id, output_quality)
+        return _build_final_response(
+            {
+                "job_id": runpod_job_id,
+                "error": f"Invalid output_quality: {output_quality}. Must be between 1-100",
+            },
+            status="error",
+        )
+
+    logger.info("Job %s started | scale=%s | image=%s | format=%s | quality=%s", runpod_job_id, scale, image_key, output_format, output_quality)
 
     # --- Download source image from S3 ---
     try:
@@ -268,13 +291,10 @@ def handler(job: dict) -> dict:
             status="error",
         )
 
-    # --- Upscale ---
+    # --- Upscale image ---
     try:
         upscale_start = time.perf_counter()
-        upsampler = _get_upsampler(scale)
-        img_array = np.array(image)
-        output_array, _ = upsampler.enhance(img_array, outscale=scale)
-        output_image = Image.fromarray(output_array)
+        output_image = _upscaler.upscale(image, scale)
         logger.info(
             "Job %s upscaled | output=%sx%s | elapsed=%.2fs",
             runpod_job_id,
@@ -294,8 +314,8 @@ def handler(job: dict) -> dict:
 
     # --- Upload result to S3 ---
     try:
-        s3_url = _upload_to_s3(output_image, S3_KEY_PREFIX)
-        logger.info("Job %s uploaded to S3 | url=%s", runpod_job_id, s3_url)
+        s3_url, final_format = _upload_to_s3(output_image, S3_KEY_PREFIX, output_format, output_quality)
+        logger.info("Job %s uploaded to S3 | url=%s | format=%s", runpod_job_id, s3_url, final_format)
     except (BotoCoreError, ClientError) as exc:
         logger.exception("Job %s S3 upload failed", runpod_job_id)
         return _build_final_response(
@@ -306,8 +326,16 @@ def handler(job: dict) -> dict:
             status="error",
         )
 
+    # --- Delete input image from S3 (optional) ---
+    if _to_bool(DELETE_INPUT_AFTER_UPSCALE):
+        try:
+            _delete_from_s3(image_key)
+            logger.info("Job %s input image deleted from S3 | key=%s", runpod_job_id, image_key)
+        except (BotoCoreError, ClientError) as exc:
+            logger.warning("Job %s failed to delete input image from S3: %s", runpod_job_id, exc)
+            # Don't fail the job if delete fails, just log warning
+
     processing_time = round(time.perf_counter() - start_time, 4)
-    record_id: int | None = None
 
     # --- Save record to database (optional) ---
     if db_enabled:
@@ -344,17 +372,15 @@ def handler(job: dict) -> dict:
     logger.info("Job %s completed | total_elapsed=%.2fs", runpod_job_id, time.perf_counter() - start_time)
 
     response_payload = {
-        "id": record_id,
         "job_id": runpod_job_id,
         "processing_time": processing_time,
-        "input_key": image_key,
-        "input_url": source_url,
-        "image_url": s3_url,
-        "format": "png",
+        "output_url": s3_url,
+        "format": final_format,
+        "output_format": final_format,
+        "output_quality": output_quality if final_format in ["jpg", "jpeg", "webp"] else None,
         "original_size": list(image.size),
         "output_size": list(output_image.size),
-        "scale": scale,
-        "database_enabled": db_enabled,
+        "scale": scale
     }
 
     return _build_final_response(response_payload, status="success")
