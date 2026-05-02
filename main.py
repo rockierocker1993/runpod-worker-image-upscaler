@@ -21,21 +21,30 @@ logging.basicConfig(
 logger = logging.getLogger("runpod-upscaler")
 
 # ---------------------------------------------------------------------------
-# S3 configuration for input images (from environment variables)
+# Storage configuration (from environment variables)
 # ---------------------------------------------------------------------------
 
-S3_BUCKET = os.environ["S3_BUCKET"]
+# Input storage mode
+INPUT_STORAGE_MODE = os.environ.get("INPUT_STORAGE_MODE", "s3").lower()  # s3 or volume
+INPUT_VOLUME_PATH = os.environ.get("INPUT_VOLUME_PATH", "/runpod-volume/inputs/")
+
+# S3 configuration (for S3 input mode)
+S3_BUCKET = os.environ.get("S3_BUCKET", "")
 S3_REGION = os.environ.get("S3_REGION", "us-east-1")
 S3_ENDPOINT_URL = os.environ.get("S3_ENDPOINT_URL")
 DELETE_INPUT_AFTER_UPSCALE = os.environ.get("DELETE_INPUT_AFTER_UPSCALE", "false")
 
+# Output storage mode
+OUTPUT_STORAGE_MODE = os.environ.get("OUTPUT_STORAGE_MODE", "cloudflare").lower()  # cloudflare or volume
+OUTPUT_VOLUME_PATH = os.environ.get("OUTPUT_VOLUME_PATH", "/runpod-volume/outputs/")
+
 # ---------------------------------------------------------------------------
-# Cloudflare Images configuration for output
+# Cloudflare Images configuration (for cloudflare output mode)
 # ---------------------------------------------------------------------------
 
-CLOUDFLARE_ACCOUNT_ID = os.environ["CLOUDFLARE_ACCOUNT_ID"]
-CLOUDFLARE_API_TOKEN = os.environ["CLOUDFLARE_API_TOKEN"]
-CLOUDFLARE_IMAGES_URL = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/images/v1"
+CLOUDFLARE_ACCOUNT_ID = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
+CLOUDFLARE_API_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN", "")
+CLOUDFLARE_IMAGES_URL = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/images/v1" if CLOUDFLARE_ACCOUNT_ID else ""
 
 # ---------------------------------------------------------------------------
 # Webhook & Database configuration
@@ -52,14 +61,17 @@ _s3_config = Config(
     }
 )
 
-_s3_client = boto3.client(
-    "s3",
-    region_name=S3_REGION,
-    endpoint_url=S3_ENDPOINT_URL,
-    aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
-    aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
-    config=_s3_config,
-)
+# Initialize S3 client only if S3 mode is used
+_s3_client = None
+if INPUT_STORAGE_MODE == "s3" or OUTPUT_STORAGE_MODE == "s3":
+    _s3_client = boto3.client(
+        "s3",
+        region_name=S3_REGION,
+        endpoint_url=S3_ENDPOINT_URL,
+        aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
+        config=_s3_config,
+    )
 
 
 def _build_object_url(object_key: str) -> str:
@@ -163,6 +175,82 @@ def _delete_from_s3(object_key: str) -> None:
     """Delete object from S3 bucket."""
     _s3_client.delete_object(Bucket=S3_BUCKET, Key=object_key)
     logger.info("Deleted S3 object: %s", object_key)
+
+
+def _read_image_from_volume(image_path: str) -> tuple[Image.Image, str]:
+    """Read source image from network volume.
+    
+    Args:
+        image_path: Relative path from INPUT_VOLUME_PATH or absolute path
+    
+    Returns:
+        Tuple of (image, full_path)
+    """
+    # Build full path
+    full_path = os.path.join(INPUT_VOLUME_PATH, image_path) if not image_path.startswith('/') else image_path
+    
+    if not os.path.exists(full_path):
+        raise FileNotFoundError(f"Image not found: {full_path}")
+    
+    image = Image.open(full_path).convert("RGB")
+    return image, full_path
+
+
+def _save_image_to_volume(image: Image.Image, output_format: str = "png", output_quality: int = 95) -> tuple[str, str]:
+    """Save image to network volume and return file path and format.
+    
+    Args:
+        image: PIL Image to save
+        output_format: Output format (png, jpg, webp)
+        output_quality: Quality for lossy formats (1-100)
+    
+    Returns:
+        Tuple of (file_path, format)
+    """
+    # Normalize format
+    fmt = output_format.lower()
+    if fmt == "jpg":
+        fmt = "jpeg"
+    
+    # Convert RGBA to RGB for formats that don't support transparency
+    if fmt in ["jpeg", "webp"]:
+        if image.mode in ("RGBA", "LA", "P"):
+            background = Image.new("RGB", image.size, (255, 255, 255))
+            if image.mode == "P":
+                image = image.convert("RGBA")
+            background.paste(image, mask=image.split()[-1] if image.mode in ("RGBA", "LA") else None)
+            image = background
+    
+    # Determine file extension
+    ext_map = {"jpeg": "jpg", "png": "png", "webp": "webp"}
+    ext = ext_map.get(fmt, "png")
+    
+    # Generate path with timestamp: outputs/YYYY/MM/DD/filename.ext
+    now = datetime.now(timezone.utc)
+    date_path = f"{now.year}/{now.month:02d}/{now.day:02d}"
+    filename = f"{uuid.uuid4().hex}.{ext}"
+    relative_path = os.path.join(date_path, filename)
+    full_path = os.path.join(OUTPUT_VOLUME_PATH, relative_path)
+    
+    # Create directory if not exists
+    os.makedirs(os.path.dirname(full_path), exist_ok=True)
+    
+    # Save image
+    if fmt in ["jpeg", "webp"]:
+        image.save(full_path, format=fmt.upper(), quality=output_quality, optimize=True)
+    else:
+        image.save(full_path, format="PNG", optimize=True)
+    
+    return full_path, ext
+
+
+def _delete_from_volume(file_path: str) -> None:
+    """Delete file from network volume."""
+    try:
+        os.remove(file_path)
+        logger.info("Deleted volume file: %s", file_path)
+    except OSError as e:
+        logger.warning("Failed to delete volume file %s: %s", file_path, e)
 
 
 def _send_webhook_callback(payload: dict) -> None:
@@ -308,10 +396,26 @@ def handler(job: dict) -> dict:
 
     logger.info("Job %s started | scale=%s | image=%s | format=%s | quality=%s", runpod_job_id, scale, image_key, output_format, output_quality)
 
-    # --- Download source image from S3 ---
+    # --- Load source image (from S3 or Volume) ---
+    source_path = None
     try:
-        image, source_url = _download_image_from_s3(image_key)
-        logger.info("Job %s image decoded | size=%sx%s", runpod_job_id, image.size[0], image.size[1])
+        if INPUT_STORAGE_MODE == "volume":
+            image, source_path = _read_image_from_volume(image_key)
+            logger.info("Job %s image loaded from volume | path=%s | size=%sx%s", 
+                       runpod_job_id, source_path, image.size[0], image.size[1])
+        else:  # s3
+            image, source_path = _download_image_from_s3(image_key)
+            logger.info("Job %s image downloaded from S3 | size=%sx%s", 
+                       runpod_job_id, image.size[0], image.size[1])
+    except FileNotFoundError as exc:
+        logger.exception("Job %s image not found in volume", runpod_job_id)
+        return _build_final_response(
+            {
+                "job_id": runpod_job_id,
+                "error": f"Image not found: {exc}",
+            },
+            status="error",
+        )
     except (BotoCoreError, ClientError) as exc:
         logger.exception("Job %s S3 download failed", runpod_job_id)
         return _build_final_response(
@@ -322,11 +426,11 @@ def handler(job: dict) -> dict:
             status="error",
         )
     except Exception as exc:
-        logger.exception("Job %s image decode failed", runpod_job_id)
+        logger.exception("Job %s image load failed", runpod_job_id)
         return _build_final_response(
             {
                 "job_id": runpod_job_id,
-                "error": f"Failed to decode image from S3: {exc}",
+                "error": f"Failed to load image: {exc}",
             },
             status="error",
         )
@@ -352,10 +456,17 @@ def handler(job: dict) -> dict:
             status="error",
         )
 
-    # --- Upload result to Cloudflare Images ---
+    # --- Save result (to Cloudflare or Volume) ---
+    output_url = None
+    output_volume_path = None
+    
     try:
-        cloudflare_url, final_format = _upload_to_cloudflare(output_image, output_format, output_quality)
-        logger.info("Job %s uploaded to Cloudflare Images | url=%s | format=%s", runpod_job_id, cloudflare_url, final_format)
+        if OUTPUT_STORAGE_MODE == "volume":
+            output_volume_path, final_format = _save_image_to_volume(output_image, output_format, output_quality)
+            logger.info("Job %s saved to volume | path=%s | format=%s", runpod_job_id, output_volume_path, final_format)
+        else:  # cloudflare
+            output_url, final_format = _upload_to_cloudflare(output_image, output_format, output_quality)
+            logger.info("Job %s uploaded to Cloudflare Images | url=%s | format=%s", runpod_job_id, output_url, final_format)
     except requests.RequestException as exc:
         logger.exception("Job %s Cloudflare upload failed", runpod_job_id)
         return _build_final_response(
@@ -366,22 +477,26 @@ def handler(job: dict) -> dict:
             status="error",
         )
     except Exception as exc:
-        logger.exception("Job %s image upload failed", runpod_job_id)
+        logger.exception("Job %s output save failed", runpod_job_id)
         return _build_final_response(
             {
                 "job_id": runpod_job_id,
-                "error": f"Image upload failed: {exc}",
+                "error": f"Failed to save output: {exc}",
             },
             status="error",
         )
 
-    # --- Delete input image from S3 (optional) ---
+    # --- Delete input (optional) ---
     if _to_bool(DELETE_INPUT_AFTER_UPSCALE):
         try:
-            _delete_from_s3(image_key)
-            logger.info("Job %s input image deleted from S3 | key=%s", runpod_job_id, image_key)
-        except (BotoCoreError, ClientError) as exc:
-            logger.warning("Job %s failed to delete input image from S3: %s", runpod_job_id, exc)
+            if INPUT_STORAGE_MODE == "volume":
+                _delete_from_volume(source_path)
+                logger.info("Job %s input deleted from volume | path=%s", runpod_job_id, source_path)
+            else:  # s3
+                _delete_from_s3(image_key)
+                logger.info("Job %s input deleted from S3 | key=%s", runpod_job_id, image_key)
+        except Exception as exc:
+            logger.warning("Job %s failed to delete input: %s", runpod_job_id, exc)
             # Don't fail the job if delete fails, just log warning
 
     processing_time = round(time.perf_counter() - start_time, 4)
@@ -392,8 +507,8 @@ def handler(job: dict) -> dict:
             record = save_upscaled_image(
                 job_id=runpod_job_id,
                 processing_time=processing_time,
-                original_url=source_url,
-                output_url=cloudflare_url,
+                original_url=source_path,
+                output_url=output_url or output_volume_path,
                 scale=scale,
                 original_size=image.size,
                 output_size=output_image.size,
@@ -423,7 +538,10 @@ def handler(job: dict) -> dict:
     response_payload = {
         "job_id": runpod_job_id,
         "processing_time": processing_time,
-        "output_url": cloudflare_url,
+        "input_storage_mode": INPUT_STORAGE_MODE,
+        "output_storage_mode": OUTPUT_STORAGE_MODE,
+        "output_url": output_url,
+        "output_volume": output_volume_path,
         "format": final_format,
         "output_format": final_format,
         "output_quality": output_quality if final_format in ["jpg", "jpeg", "webp"] else None,

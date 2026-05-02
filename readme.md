@@ -4,14 +4,14 @@ RunPod serverless worker untuk upscaling gambar menggunakan Real-ESRGAN dengan d
 
 ## 📋 Fitur
 
-- ✅ Download gambar dari S3 atau S3-compatible storage (MinIO, R2, etc)
+- ✅ **Flexible Input Storage**: S3 atau RunPod Network Volume
+- ✅ **Flexible Output Storage**: Cloudflare Images (CDN) atau Network Volume
 - ✅ Upscale gambar 2x atau 4x menggunakan Real-ESRGAN
-- ✅ Upload hasil ke Cloudflare Images dengan CDN global
 - ✅ Multi-format output: PNG (lossless), JPG, WebP dengan quality control
-- ✅ Auto-delete input image dari S3 setelah upscaling (opsional)
+- ✅ Auto-delete input image setelah upscaling (opsional)
 - ✅ Simpan metadata ke database PostgreSQL (opsional)
 - ✅ Webhook callback async untuk notifikasi status (success/error)
-- ✅ Model bundling di Docker image
+- ✅ Model bundling di Docker image atau dari Network Volume
 - ✅ GPU acceleration (CUDA 11.8)
 
 ## 🖥️ System Requirements
@@ -96,8 +96,9 @@ runpod-worker-image-upscaler/
                          │
                          ▼
 ┌─────────────────────────────────────────────────────────────┐
-│              2. Download from S3 Storage                     │
-│             _download_image_from_s3(image)                   │
+│         2. Load Image (S3 or Network Volume)                 │
+│   • S3 mode: _download_image_from_s3()                       │
+│   • Volume mode: _read_image_from_volume()                   │
 │                 → PIL Image (RGB)                            │
 └────────────────────────┬────────────────────────────────────┘
                          │
@@ -114,15 +115,15 @@ runpod-worker-image-upscaler/
                          │
                          ▼
 ┌─────────────────────────────────────────────────────────────┐
-│              4. Upload Result to Cloudflare Images           │
-│      _upload_to_cloudflare(output_image) → URL               │
-│     Path: upscale-results/YYYY/MM/DD/{uuid}.{ext}            │
+│       4. Save Result (Cloudflare or Network Volume)          │
+│   • Cloudflare mode: _upload_to_cloudflare() → URL           │
+│   • Volume mode: _save_image_to_volume() → Path              │
 └────────────────────────┬────────────────────────────────────┘
                          │
                          ▼
 ┌─────────────────────────────────────────────────────────────┐
-│      5. Delete Input from S3 (Optional)                      │
-│   if DELETE_INPUT_AFTER_UPSCALE: delete input image          │
+│      5. Delete Input (Optional)                              │
+│   if DELETE_INPUT_AFTER_UPSCALE: delete from S3/volume       │
 └────────────────────────┬────────────────────────────────────┘
                          │
                          ▼
@@ -204,7 +205,13 @@ docker build -t your-username/runpod-upscaler:latest .
    - Set worker count & max workers
    - Deploy endpoint
 
-4. **Test via API**:
+4. **(Optional) Setup Network Volume**:
+   - Create Network Volume di RunPod (if using volume storage mode)
+   - Attach volume ke serverless endpoint
+   - Mount path: `/runpod-volume`
+   - Upload models & input images ke volume
+
+5. **Test via API**:
    ```bash
    curl -X POST https://api.runpod.ai/v2/YOUR_ENDPOINT_ID/run \
      -H "Authorization: Bearer YOUR_API_KEY" \
@@ -219,31 +226,98 @@ docker build -t your-username/runpod-upscaler:latest .
      }'
    ```
 
+## 📦 Network Volume Setup (Optional)
+
+Network Volume memberikan persistent storage untuk models dan images.
+
+### Upload Models ke Network Volume
+
+```bash
+# SSH ke RunPod Pod atau gunakan file manager
+mkdir -p /runpod-volume/models
+cd /runpod-volume/models
+
+# Download models
+wget https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth
+wget https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth
+```
+
+### Upload Input Images
+
+```bash
+# Create inputs directory
+mkdir -p /runpod-volume/inputs
+
+# Upload images (via SCP, rsync, or RunPod file manager)
+scp -r /local/images/* user@pod:/runpod-volume/inputs/
+```
+
+### Environment Variables untuk Volume Mode
+
+```env
+# Use models from network volume
+MODEL_2X_PATH=/runpod-volume/models/RealESRGAN_x2plus.pth
+MODEL_4X_PATH=/runpod-volume/models/RealESRGAN_x4plus.pth
+
+# Use volume for input/output
+INPUT_STORAGE_MODE=volume
+OUTPUT_STORAGE_MODE=volume
+```
+
+**Benefits**:
+- ✅ Smaller Docker image (~2GB vs ~10GB)
+- ✅ Faster cold starts
+- ✅ Update models without rebuilding image
+- ✅ Shared storage across workers
+   ```
+
 ## ⚙️ Configuration
 
 ### Environment Variables
 
 Buat file `.env` dari `.env-example`:
 
-#### S3 Storage (for input images)
+#### Storage Configuration
+```env
+# Input Storage Mode
+INPUT_STORAGE_MODE=s3                  # s3 or volume
+INPUT_VOLUME_PATH=/runpod-volume/inputs/
+
+# Output Storage Mode
+OUTPUT_STORAGE_MODE=cloudflare         # cloudflare or volume
+OUTPUT_VOLUME_PATH=/runpod-volume/outputs/
+
+# Auto-delete input after processing
+DELETE_INPUT_AFTER_UPSCALE=false
+```
+
+**Storage Modes**:
+
+| Mode | Input | Output | Use Case |
+|------|-------|--------|----------|
+| **S3 + Cloudflare** | S3 bucket | Cloudflare Images CDN | External storage + global CDN delivery |
+| **Volume + Volume** | Network Volume | Network Volume | All-in-one RunPod storage (fastest) |
+| **Volume + Cloudflare** | Network Volume | Cloudflare Images CDN | Bulk processing + CDN delivery |
+| **S3 + Volume** | S3 bucket | Network Volume | External input + local archive |
+
+#### S3 Configuration (when INPUT_STORAGE_MODE=s3)
 ```env
 S3_BUCKET=your-bucket-name
 S3_REGION=us-east-1
 S3_ENDPOINT_URL=https://your-s3-endpoint.com  # Optional, untuk non-AWS S3
-DELETE_INPUT_AFTER_UPSCALE=false              # Delete input image after upscaling
 AWS_ACCESS_KEY_ID=your-access-key
 AWS_SECRET_ACCESS_KEY=your-secret-key
 ```
 
-**Note**: `DELETE_INPUT_AFTER_UPSCALE` akan menghapus input image dari S3 setelah upscaling berhasil. Set `true` untuk auto-delete.
-
-#### Cloudflare Images (for output images)
+#### Cloudflare Images (when OUTPUT_STORAGE_MODE=cloudflare)
 ```env
 CLOUDFLARE_ACCOUNT_ID=your-account-id
 CLOUDFLARE_API_TOKEN=your-api-token
 ```
 
-**Note**: Output images akan di-upload ke Cloudflare Images dengan CDN global. Path format: `upscale-results/YYYY/MM/DD/{filename}.{ext}`
+**Output Paths**:
+- **Cloudflare**: `upscale-results/YYYY/MM/DD/{uuid}.{ext}`
+- **Volume**: `/runpod-volume/outputs/YYYY/MM/DD/{uuid}.{ext}`
 
 #### Database (Optional)
 ```env
@@ -300,25 +374,30 @@ LOG_LEVEL=INFO                                 # DEBUG, INFO, WARNING, ERROR
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `input.image` | string | Yes | - | S3 object key untuk source image |
+| `input.image` | string | Yes | - | Image path/key (S3 key or volume path) |
 | `input.scale` | integer | No | 4 | Upscale factor (2 atau 4) |
 | `input.output_format` | string | No | `png` | Output format: `png`, `jpg`, `jpeg`, `webp` |
 | `input.output_quality` | integer | No | 95 | Quality untuk lossy formats (1-100) |
 
 **Notes**: 
+- `input.image` format tergantung storage mode:
+  - S3 mode: `folder/image.jpg` (S3 object key)
+  - Volume mode: `batch/image.jpg` (relative path dari INPUT_VOLUME_PATH)
 - `output_quality` hanya berlaku untuk `jpg` dan `webp` (lossy formats)
 - PNG selalu lossless (quality diabaikan)
-- Database control via `ENABLE_DATABASE` environment variable
 
 ### Output Response Format
 
-#### Success Response
+#### Success Response (Cloudflare Output)
 ```json
 {
   "status": "success",
   "job_id": "job-12345",
   "processing_time": 2.3456,
+  "input_storage_mode": "s3",
+  "output_storage_mode": "cloudflare",
   "output_url": "https://imagedelivery.net/account-hash/image-id/public",
+  "output_volume": null,
   "format": "jpg",
   "output_format": "jpg",
   "output_quality": 90,
@@ -329,6 +408,33 @@ LOG_LEVEL=INFO                                 # DEBUG, INFO, WARNING, ERROR
   "error_message": null
 }
 ```
+
+#### Success Response (Volume Output)
+```json
+{
+  "status": "success",
+  "job_id": "job-12345",
+  "processing_time": 2.3456,
+  "input_storage_mode": "volume",
+  "output_storage_mode": "volume",
+  "output_url": null,
+  "output_volume": "/runpod-volume/outputs/2026/05/02/abc123def456.jpg",
+  "format": "jpg",
+  "output_format": "jpg",
+  "output_quality": 90,
+  "original_size": [1024, 768],
+  "output_size": [4096, 3072],
+  "scale": 4,
+  "webhook_triggered_at": "2026-05-02T10:30:45.123456+00:00",
+  "error_message": null
+}
+```
+
+**Response Fields**:
+- `input_storage_mode`: Storage mode used for input (`s3` or `volume`)
+- `output_storage_mode`: Storage mode used for output (`cloudflare` or `volume`)
+- `output_url`: Public URL (only when `output_storage_mode=cloudflare`)
+- `output_volume`: File path in network volume (only when `output_storage_mode=volume`)
 
 #### Error Response
 ```json
