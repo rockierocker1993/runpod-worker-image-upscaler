@@ -21,14 +21,26 @@ logging.basicConfig(
 logger = logging.getLogger("runpod-upscaler")
 
 # ---------------------------------------------------------------------------
-# S3 configuration (from environment variables)
+# S3 configuration for input images (from environment variables)
 # ---------------------------------------------------------------------------
 
 S3_BUCKET = os.environ["S3_BUCKET"]
 S3_REGION = os.environ.get("S3_REGION", "us-east-1")
-S3_KEY_PREFIX = os.environ.get("S3_KEY_PREFIX", "upscaled/")
 S3_ENDPOINT_URL = os.environ.get("S3_ENDPOINT_URL")
 DELETE_INPUT_AFTER_UPSCALE = os.environ.get("DELETE_INPUT_AFTER_UPSCALE", "false")
+
+# ---------------------------------------------------------------------------
+# Cloudflare Images configuration for output
+# ---------------------------------------------------------------------------
+
+CLOUDFLARE_ACCOUNT_ID = os.environ["CLOUDFLARE_ACCOUNT_ID"]
+CLOUDFLARE_API_TOKEN = os.environ["CLOUDFLARE_API_TOKEN"]
+CLOUDFLARE_IMAGES_URL = f"https://api.cloudflare.com/client/v4/accounts/{CLOUDFLARE_ACCOUNT_ID}/images/v1"
+
+# ---------------------------------------------------------------------------
+# Webhook & Database configuration
+# ---------------------------------------------------------------------------
+
 WEBHOOK_CALLBACK_URL = os.environ.get("WEBHOOK_CALLBACK_URL")
 WEBHOOK_TIMEOUT_SECONDS = float(os.environ.get("WEBHOOK_TIMEOUT_SECONDS", "10"))
 WEBHOOK_AUTH_TOKEN = os.environ.get("WEBHOOK_AUTH_TOKEN")
@@ -57,12 +69,11 @@ def _build_object_url(object_key: str) -> str:
     return f"https://{S3_BUCKET}.s3.{S3_REGION}.amazonaws.com/{object_key}"
 
 
-def _upload_to_s3(image: Image.Image, key_prefix: str, output_format: str = "png", output_quality: int = 95) -> tuple[str, str]:
-    """Upload a PIL image to S3 and return its public URL and format.
+def _upload_to_cloudflare(image: Image.Image, output_format: str = "png", output_quality: int = 95) -> tuple[str, str]:
+    """Upload a PIL image to Cloudflare Images and return its public URL and format.
     
     Args:
         image: PIL Image to upload
-        key_prefix: S3 key prefix
         output_format: Output format (png, jpg, webp)
         output_quality: Quality for lossy formats (1-100)
     
@@ -93,22 +104,51 @@ def _upload_to_s3(image: Image.Image, key_prefix: str, output_format: str = "png
     
     buffer.seek(0)
     
-    # Determine file extension and content type
+    # Determine file extension
     ext_map = {"jpeg": "jpg", "png": "png", "webp": "webp"}
-    content_type_map = {"jpeg": "image/jpeg", "png": "image/png", "webp": "image/webp"}
-    
     ext = ext_map.get(fmt, "png")
-    content_type = content_type_map.get(fmt, "image/png")
-    object_key = f"{key_prefix}{uuid.uuid4().hex}.{ext}"
-
-    _s3_client.upload_fileobj(
-        buffer,
-        S3_BUCKET,
-        object_key,
-        ExtraArgs={"ContentType": content_type},
+    
+    # Generate custom ID with timestamp path: upscale-results/YYYY/MM/DD/filename.ext
+    now = datetime.now(timezone.utc)
+    image_name = f"{uuid.uuid4().hex}.{ext}"
+    custom_id = f"upscale-results/{now.year}/{now.month:02d}/{now.day:02d}/{image_name}"
+    
+    # Prepare multipart form data
+    files = {
+        'file': (image_name, buffer, f'image/{ext}')
+    }
+    data = {
+        'metadata': '{"key":"upscaler"}',
+        'requireSignedURLs': 'false',
+        'id': custom_id
+    }
+    headers = {
+        'Authorization': f'Bearer {CLOUDFLARE_API_TOKEN}'
+    }
+    
+    # Upload to Cloudflare Images
+    response = requests.post(
+        CLOUDFLARE_IMAGES_URL,
+        files=files,
+        data=data,
+        headers=headers,
+        timeout=30
     )
-
-    return _build_object_url(object_key), ext
+    response.raise_for_status()
+    
+    result = response.json()
+    if not result.get('success'):
+        raise Exception(f"Cloudflare upload failed: {result.get('errors')}")
+    
+    # Get the public variant URL
+    variants = result.get('result', {}).get('variants', [])
+    if not variants:
+        raise Exception("No image variants returned from Cloudflare")
+    
+    # Use the first variant (public URL)
+    image_url = variants[0]
+    
+    return image_url, ext
 
 
 def _download_image_from_s3(object_key: str) -> tuple[Image.Image, str]:
@@ -312,16 +352,25 @@ def handler(job: dict) -> dict:
             status="error",
         )
 
-    # --- Upload result to S3 ---
+    # --- Upload result to Cloudflare Images ---
     try:
-        s3_url, final_format = _upload_to_s3(output_image, S3_KEY_PREFIX, output_format, output_quality)
-        logger.info("Job %s uploaded to S3 | url=%s | format=%s", runpod_job_id, s3_url, final_format)
-    except (BotoCoreError, ClientError) as exc:
-        logger.exception("Job %s S3 upload failed", runpod_job_id)
+        cloudflare_url, final_format = _upload_to_cloudflare(output_image, output_format, output_quality)
+        logger.info("Job %s uploaded to Cloudflare Images | url=%s | format=%s", runpod_job_id, cloudflare_url, final_format)
+    except requests.RequestException as exc:
+        logger.exception("Job %s Cloudflare upload failed", runpod_job_id)
         return _build_final_response(
             {
                 "job_id": runpod_job_id,
-                "error": f"S3 upload failed: {exc}",
+                "error": f"Cloudflare upload failed: {exc}",
+            },
+            status="error",
+        )
+    except Exception as exc:
+        logger.exception("Job %s image upload failed", runpod_job_id)
+        return _build_final_response(
+            {
+                "job_id": runpod_job_id,
+                "error": f"Image upload failed: {exc}",
             },
             status="error",
         )
@@ -344,7 +393,7 @@ def handler(job: dict) -> dict:
                 job_id=runpod_job_id,
                 processing_time=processing_time,
                 original_url=source_url,
-                output_url=s3_url,
+                output_url=cloudflare_url,
                 scale=scale,
                 original_size=image.size,
                 output_size=output_image.size,
@@ -374,7 +423,7 @@ def handler(job: dict) -> dict:
     response_payload = {
         "job_id": runpod_job_id,
         "processing_time": processing_time,
-        "output_url": s3_url,
+        "output_url": cloudflare_url,
         "format": final_format,
         "output_format": final_format,
         "output_quality": output_quality if final_format in ["jpg", "jpeg", "webp"] else None,

@@ -6,9 +6,10 @@ RunPod serverless worker untuk upscaling gambar menggunakan Real-ESRGAN dengan d
 
 - ✅ Download gambar dari S3 atau S3-compatible storage (MinIO, R2, etc)
 - ✅ Upscale gambar 2x atau 4x menggunakan Real-ESRGAN
+- ✅ Upload hasil ke Cloudflare Images dengan CDN global
 - ✅ Multi-format output: PNG (lossless), JPG, WebP dengan quality control
 - ✅ Auto-delete input image dari S3 setelah upscaling (opsional)
-- ✅ Simpan metadata ke database PostgreSQL (opsional, per-job atau global)
+- ✅ Simpan metadata ke database PostgreSQL (opsional)
 - ✅ Webhook callback async untuk notifikasi status (success/error)
 - ✅ Model bundling di Docker image
 - ✅ GPU acceleration (CUDA 11.8)
@@ -30,7 +31,7 @@ RunPod serverless worker untuk upscaling gambar menggunakan Real-ESRGAN dengan d
 ### Cloud (RunPod)
 - **GPU Instance**: RTX 3080/3090, A4000, A5000, atau lebih tinggi
 - **Disk Space**: Minimal 10GB
-- **Network**: Akses ke S3 endpoint
+- **Network**: Akses ke S3 endpoint (input) dan Cloudflare API (output)
 
 ## 📦 Dependencies
 
@@ -113,8 +114,9 @@ runpod-worker-image-upscaler/
                          │
                          ▼
 ┌─────────────────────────────────────────────────────────────┐
-│              4. Upload Result to S3                          │
-│         _upload_to_s3(output_image) → URL                    │
+│              4. Upload Result to Cloudflare Images           │
+│      _upload_to_cloudflare(output_image) → URL               │
+│     Path: upscale-results/YYYY/MM/DD/{uuid}.{ext}            │
 └────────────────────────┬────────────────────────────────────┘
                          │
                          ▼
@@ -223,11 +225,10 @@ docker build -t your-username/runpod-upscaler:latest .
 
 Buat file `.env` dari `.env-example`:
 
-#### S3 Storage (Required)
+#### S3 Storage (for input images)
 ```env
 S3_BUCKET=your-bucket-name
 S3_REGION=us-east-1
-S3_KEY_PREFIX=upscaled/
 S3_ENDPOINT_URL=https://your-s3-endpoint.com  # Optional, untuk non-AWS S3
 DELETE_INPUT_AFTER_UPSCALE=false              # Delete input image after upscaling
 AWS_ACCESS_KEY_ID=your-access-key
@@ -235,6 +236,14 @@ AWS_SECRET_ACCESS_KEY=your-secret-key
 ```
 
 **Note**: `DELETE_INPUT_AFTER_UPSCALE` akan menghapus input image dari S3 setelah upscaling berhasil. Set `true` untuk auto-delete.
+
+#### Cloudflare Images (for output images)
+```env
+CLOUDFLARE_ACCOUNT_ID=your-account-id
+CLOUDFLARE_API_TOKEN=your-api-token
+```
+
+**Note**: Output images akan di-upload ke Cloudflare Images dengan CDN global. Path format: `upscale-results/YYYY/MM/DD/{filename}.{ext}`
 
 #### Database (Optional)
 ```env
@@ -308,18 +317,14 @@ LOG_LEVEL=INFO                                 # DEBUG, INFO, WARNING, ERROR
 {
   "status": "success",
   "job_id": "job-12345",
-  "id": 42,
   "processing_time": 2.3456,
-  "input": "input/sample.png",
-  "input_url": "https://bucket.s3.region.amazonaws.com/input/sample.png",
-  "image_url": "https://bucket.s3.region.amazonaws.com/upscaled/abc123.jpg",
+  "output_url": "https://imagedelivery.net/account-hash/image-id/public",
   "format": "jpg",
   "output_format": "jpg",
   "output_quality": 90,
   "original_size": [1024, 768],
   "output_size": [4096, 3072],
   "scale": 4,
-  "database_enabled": true,
   "webhook_triggered_at": "2026-05-02T10:30:45.123456+00:00",
   "error_message": null
 }
@@ -373,7 +378,7 @@ CREATE TABLE upscaled_images (
 - **job_id**: RunPod job ID
 - **processing_time**: Waktu processing dalam detik
 - **original_url**: URL source image di S3
-- **output_url**: URL hasil upscale di S3
+- **output_url**: URL hasil upscale di Cloudflare Images
 - **scale**: Upscale factor (2 atau 4)
 - **original_width/height**: Dimensi original image
 - **output_width/height**: Dimensi output image
@@ -390,8 +395,8 @@ docker compose exec app psql $DATABASE_URL -f db/migrations/init.sql
 
 ### main.py - Pipeline Flow
 **Responsibility**: Orchestration & integration
-- RunPod handler setup
-- S3 operations (download/upload)
+- S3 operations (download input images)
+- Cloudflare Images upload (output images)
 - Webhook callbacks
 - Database integration
 - Error handling & logging
@@ -400,7 +405,7 @@ docker compose exec app psql $DATABASE_URL -f db/migrations/init.sql
 **Key Functions**:
 - `handler(job)` - Main RunPod handler
 - `_download_image_from_s3()` - Download from S3
-- `_upload_to_s3()` - Upload to S3
+- `_upload_to_cloudflare()` - Upload to Cloudflare Images
 - `_send_webhook_callback()` - Send webhook
 - `_build_final_response()` - Format response
 
@@ -544,6 +549,23 @@ curl -X POST https://api.runpod.ai/v2/YOUR_ENDPOINT_ID/runsync \
 - Verify field `image` benar (S3 object key)
 - Check S3 credentials & bucket permissions
 - Verify `S3_BUCKET` dan `S3_ENDPOINT_URL` configuration
+
+### Cloudflare upload failed
+
+**Error**: `Cloudflare upload failed: 403 Forbidden`
+
+**Solution**:
+- Verify `CLOUDFLARE_API_TOKEN` valid dan belum expired
+- Check `CLOUDFLARE_ACCOUNT_ID` benar
+- Verify API token memiliki permission "Cloudflare Images: Edit"
+- Check Cloudflare Images quota (free tier: 100k images)
+
+**Error**: `No image variants returned from Cloudflare`
+
+**Solution**:
+- Check Cloudflare Images account setup
+- Verify variant "public" exists di account settings
+- Review Cloudflare Images documentation
 
 ### Database connection failed
 
