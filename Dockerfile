@@ -1,5 +1,15 @@
 FROM runpod/base:0.6.2-cuda12.1.0
 
+# ---------------------------------------------------------------------------
+# CUDA / PyTorch performance environment variables
+# ---------------------------------------------------------------------------
+# Lazy-load CUDA modules → faster cold start for serverless
+ENV CUDA_MODULE_LOADING=LAZY
+# Reduce VRAM fragmentation between serverless jobs
+ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# Disable Python output buffering for cleaner RunPod logs
+ENV PYTHONUNBUFFERED=1
+
 WORKDIR /app
 
 # System dependencies for Pillow / OpenCV used by Real-ESRGAN
