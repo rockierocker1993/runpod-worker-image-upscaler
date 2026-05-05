@@ -253,9 +253,10 @@ def _delete_from_volume(file_path: str) -> None:
         logger.warning("Failed to delete volume file %s: %s", file_path, e)
 
 
-def _send_webhook_callback(payload: dict) -> None:
+def _send_webhook_callback(payload: dict, webhook_url: str | None = None) -> None:
     """Send callback payload to webhook endpoint."""
-    if not WEBHOOK_CALLBACK_URL:
+    effective_url = webhook_url or WEBHOOK_CALLBACK_URL
+    if not effective_url:
         return
 
     headers = {"Content-Type": "application/json"}
@@ -266,15 +267,16 @@ def _send_webhook_callback(payload: dict) -> None:
 
     try:
         response = requests.post(
-            WEBHOOK_CALLBACK_URL,
+            effective_url,
             json=payload,
             headers=headers,
             timeout=WEBHOOK_TIMEOUT_SECONDS,
         )
         response.raise_for_status()
         logger.info(
-            "Job %s webhook callback sent | status=%s | elapsed=%.3fs",
+            "Job %s webhook callback sent | url=%s | status=%s | elapsed=%.3fs",
             payload.get("job_id"),
+            effective_url,
             response.status_code,
             time.perf_counter() - started_at,
         )
@@ -287,12 +289,13 @@ def _send_webhook_callback(payload: dict) -> None:
         )
 
 
-def _trigger_webhook_async(payload: dict) -> None:
+def _trigger_webhook_async(payload: dict, webhook_url: str | None = None) -> None:
     """Dispatch webhook callback in a daemon thread so handler can return immediately."""
-    if not WEBHOOK_CALLBACK_URL:
+    effective_url = webhook_url or WEBHOOK_CALLBACK_URL
+    if not effective_url:
         return
 
-    thread = threading.Thread(target=_send_webhook_callback, args=(payload,), daemon=True)
+    thread = threading.Thread(target=_send_webhook_callback, args=(payload, effective_url), daemon=True)
     thread.start()
 
 
@@ -301,17 +304,20 @@ def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _build_final_response(payload: dict, status: str) -> dict:
+def _build_final_response(payload: dict, status: str, webhook_url: str | None = None, webhook_enabled: bool = True) -> dict:
     """Attach status and webhook trigger info, then dispatch async callback when enabled."""
     response_payload = dict(payload)
     response_payload["status"] = status
     response_payload["error_message"] = response_payload.get("error") if status == "error" else None
 
-    webhook_triggered_at = _utc_now_iso() if WEBHOOK_CALLBACK_URL else None
+    effective_url = webhook_url or WEBHOOK_CALLBACK_URL
+    should_trigger = webhook_enabled and bool(effective_url)
+
+    webhook_triggered_at = _utc_now_iso() if should_trigger else None
     response_payload["webhook_triggered_at"] = webhook_triggered_at
 
-    if WEBHOOK_CALLBACK_URL:
-        _trigger_webhook_async(response_payload)
+    if should_trigger:
+        _trigger_webhook_async(response_payload, webhook_url=effective_url)
 
     return response_payload
 
@@ -344,11 +350,29 @@ def handler(job: dict) -> dict:
     runpod_job_id: str | None = job.get("id")
     db_enabled: bool = _to_bool(ENABLE_DATABASE)
 
+    # --- Webhook config (per-request overrides env defaults) ---
+    request_webhook_url: str | None = job_input.get("webhook_url") or None
+    webhook_enabled: bool = _to_bool(job_input.get("webhook_enabled", True))
+    logger.debug(
+        "Job %s webhook config | enabled=%s | url=%s",
+        runpod_job_id,
+        webhook_enabled,
+        request_webhook_url or "(env default)",
+    )
+
+    # Local helper: forward webhook config to every response in this job
+    def _respond(payload: dict, status: str) -> dict:
+        return _build_final_response(
+            payload, status=status,
+            webhook_url=request_webhook_url,
+            webhook_enabled=webhook_enabled,
+        )
+
     # --- Validate input ---
     image_key: str | None = job_input.get("image")
     if not image_key:
         logger.warning("Job %s rejected: missing image", runpod_job_id)
-        return _build_final_response(
+        return _respond(
             {
                 "job_id": runpod_job_id,
                 "error": "Missing required field: image",
@@ -359,7 +383,7 @@ def handler(job: dict) -> dict:
     scale: int = int(job_input.get("scale", 4))
     if scale not in ImageUpscaler.MODEL_CONFIGS:
         logger.warning("Job %s rejected: unsupported scale=%s", runpod_job_id, scale)
-        return _build_final_response(
+        return _respond(
             {
                 "job_id": runpod_job_id,
                 "error": f"Unsupported scale: {scale}. Must be one of {list(ImageUpscaler.MODEL_CONFIGS.keys())}",
@@ -375,7 +399,7 @@ def handler(job: dict) -> dict:
     valid_formats = ["png", "jpg", "jpeg", "webp"]
     if output_format not in valid_formats:
         logger.warning("Job %s rejected: unsupported output_format=%s", runpod_job_id, output_format)
-        return _build_final_response(
+        return _respond(
             {
                 "job_id": runpod_job_id,
                 "error": f"Unsupported output_format: {output_format}. Must be one of {valid_formats}",
@@ -386,7 +410,7 @@ def handler(job: dict) -> dict:
     # Validate quality
     if not (1 <= output_quality <= 100):
         logger.warning("Job %s rejected: invalid output_quality=%s", runpod_job_id, output_quality)
-        return _build_final_response(
+        return _respond(
             {
                 "job_id": runpod_job_id,
                 "error": f"Invalid output_quality: {output_quality}. Must be between 1-100",
@@ -409,7 +433,7 @@ def handler(job: dict) -> dict:
                        runpod_job_id, image.size[0], image.size[1])
     except FileNotFoundError as exc:
         logger.exception("Job %s image not found in volume", runpod_job_id)
-        return _build_final_response(
+        return _respond(
             {
                 "job_id": runpod_job_id,
                 "error": f"Image not found: {exc}",
@@ -418,7 +442,7 @@ def handler(job: dict) -> dict:
         )
     except (BotoCoreError, ClientError) as exc:
         logger.exception("Job %s S3 download failed", runpod_job_id)
-        return _build_final_response(
+        return _respond(
             {
                 "job_id": runpod_job_id,
                 "error": f"S3 download failed: {exc}",
@@ -427,7 +451,7 @@ def handler(job: dict) -> dict:
         )
     except Exception as exc:
         logger.exception("Job %s image load failed", runpod_job_id)
-        return _build_final_response(
+        return _respond(
             {
                 "job_id": runpod_job_id,
                 "error": f"Failed to load image: {exc}",
@@ -448,7 +472,7 @@ def handler(job: dict) -> dict:
         )
     except Exception as exc:
         logger.exception("Job %s upscaling failed", runpod_job_id)
-        return _build_final_response(
+        return _respond(
             {
                 "job_id": runpod_job_id,
                 "error": f"Upscaling failed: {exc}",
@@ -469,7 +493,7 @@ def handler(job: dict) -> dict:
             logger.info("Job %s uploaded to Cloudflare Images | url=%s | format=%s", runpod_job_id, output_url, final_format)
     except requests.RequestException as exc:
         logger.exception("Job %s Cloudflare upload failed", runpod_job_id)
-        return _build_final_response(
+        return _respond(
             {
                 "job_id": runpod_job_id,
                 "error": f"Cloudflare upload failed: {exc}",
@@ -478,7 +502,7 @@ def handler(job: dict) -> dict:
         )
     except Exception as exc:
         logger.exception("Job %s output save failed", runpod_job_id)
-        return _build_final_response(
+        return _respond(
             {
                 "job_id": runpod_job_id,
                 "error": f"Failed to save output: {exc}",
@@ -522,7 +546,7 @@ def handler(job: dict) -> dict:
             )
         except Exception as exc:
             logger.exception("Job %s database insert failed", runpod_job_id)
-            return _build_final_response(
+            return _respond(
                 {
                     "job_id": runpod_job_id,
                     "error": f"Database insert failed: {exc}",
@@ -550,7 +574,7 @@ def handler(job: dict) -> dict:
         "scale": scale
     }
 
-    return _build_final_response(response_payload, status="success")
+    return _respond(response_payload, status="success")
 
 
 if __name__ == "__main__":

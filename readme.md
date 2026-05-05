@@ -365,7 +365,9 @@ LOG_LEVEL=INFO                                 # DEBUG, INFO, WARNING, ERROR
     "image": "folder/image.jpg",
     "scale": 4,
     "output_format": "jpg",
-    "output_quality": 90
+    "output_quality": 90,
+    "webhook_enabled": true,
+    "webhook_url": "https://your-app.com/webhook/callback"
   }
 }
 ```
@@ -377,8 +379,8 @@ LOG_LEVEL=INFO                                 # DEBUG, INFO, WARNING, ERROR
 | `input.image` | string | Yes | - | Image path/key (S3 key or volume path) |
 | `input.scale` | integer | No | 4 | Upscale factor (2 atau 4) |
 | `input.output_format` | string | No | `png` | Output format: `png`, `jpg`, `jpeg`, `webp` |
-| `input.output_quality` | integer | No | 95 | Quality untuk lossy formats (1-100) |
-
+| `input.output_quality` | integer | No | 95 | Quality untuk lossy formats (1-100) || `input.webhook_enabled` | boolean | No | `true` | Aktifkan/nonaktifkan webhook untuk job ini |
+| `input.webhook_url` | string | No | - | Override `WEBHOOK_CALLBACK_URL` untuk job ini |
 **Notes**: 
 - `input.image` format tergantung storage mode:
   - S3 mode: `folder/image.jpg` (S3 object key)
@@ -449,7 +451,12 @@ LOG_LEVEL=INFO                                 # DEBUG, INFO, WARNING, ERROR
 
 ### Webhook Callback
 
-Jika `WEBHOOK_CALLBACK_URL` dikonfigurasi, worker akan send POST request async:
+Webhook dikirim secara async (non-blocking) setelah job selesai. URL dan enable/disable bisa dikonfigurasi via env **atau** di-override per-request:
+
+**Priority**:
+1. Jika `webhook_enabled: false` di request → webhook tidak dikirim (env URL diabaikan)
+2. Jika `webhook_url` diisi di request → URL tersebut digunakan
+3. Jika tidak → fallback ke env `WEBHOOK_CALLBACK_URL`
 
 **Headers:**
 ```
