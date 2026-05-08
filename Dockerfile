@@ -1,4 +1,4 @@
-FROM runpod/base:0.6.2-cuda12.1.0
+FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
 
 # ---------------------------------------------------------------------------
 # CUDA / PyTorch performance environment variables
@@ -9,13 +9,20 @@ ENV CUDA_MODULE_LOADING=LAZY
 ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # Disable Python output buffering for cleaner RunPod logs
 ENV PYTHONUNBUFFERED=1
+# Prevent interactive prompts during apt installs
+ENV DEBIAN_FRONTEND=noninteractive
 
 WORKDIR /app
 
-# System dependencies for Pillow / OpenCV used by Real-ESRGAN
+# Python 3.10 + system dependencies for Pillow / OpenCV used by Real-ESRGAN
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.10 \
+    python3-pip \
+    python3.10-dev \
     libgl1 \
     libglib2.0-0 \
+    && ln -sf /usr/bin/python3.10 /usr/bin/python3 \
+    && ln -sf /usr/bin/pip3 /usr/bin/pip \
     && rm -rf /var/lib/apt/lists/*
 
 # Pre-install torch for CUDA 12.1 so basicsr setup.py does not pull in
@@ -31,9 +38,6 @@ RUN python3 -m pip install --no-cache-dir --no-build-isolation basicsr \
  && python3 -m pip install --no-cache-dir -r requirements.txt \
  && sed -i 's/from torchvision.transforms.functional_tensor import rgb_to_grayscale/from torchvision.transforms.functional import rgb_to_grayscale/' \
     /usr/local/lib/python3.10/dist-packages/basicsr/data/degradations.py
-
-# Copy model files to /models directory
-COPY models/ /models/
 
 # Application code
 COPY . .

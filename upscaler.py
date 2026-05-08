@@ -42,12 +42,12 @@ class ImageUpscaler:
     MODEL_CONFIGS = {
         2: {
             "name": "RealESRGAN_x2plus",
-            "path": os.environ.get("MODEL_2X_PATH", "/models/RealESRGAN_x2plus.pth"),
+            "path": os.environ.get("MODEL_2X_PATH", f"{os.environ.get('REAL_ESRGAN_HOME', '/runpod-volume/real-esrgan-models')}/RealESRGAN_x2plus.pth"),
             "num_block": 23,
         },
         4: {
             "name": "RealESRGAN_x4plus",
-            "path": os.environ.get("MODEL_4X_PATH", "/models/RealESRGAN_x4plus.pth"),
+            "path": os.environ.get("MODEL_4X_PATH", f"{os.environ.get('REAL_ESRGAN_HOME', '/runpod-volume/real-esrgan-models')}/RealESRGAN_x4plus.pth"),
             "num_block": 23,
         },
     }
