@@ -11,8 +11,8 @@ RunPod serverless worker untuk upscaling gambar menggunakan Real-ESRGAN dengan d
 - ✅ Auto-delete input image setelah upscaling (opsional)
 - ✅ Simpan metadata ke database PostgreSQL (opsional)
 - ✅ Webhook callback async untuk notifikasi status (success/error)
-- ✅ Model bundling di Docker image atau dari Network Volume
-- ✅ GPU acceleration (CUDA 11.8)
+- ✅ Models di-load dari RunPod Network Volume
+- ✅ GPU acceleration (CUDA 12.4) dengan FP16 & TF32 optimization
 
 ## 🖥️ System Requirements
 
@@ -26,7 +26,7 @@ RunPod serverless worker untuk upscaling gambar menggunakan Real-ESRGAN dengan d
 - **Docker**: 20.10 atau lebih baru
 - **Docker Compose**: 2.0 atau lebih baru
 - **NVIDIA Container Toolkit**: Untuk GPU support di Docker
-- **CUDA**: 11.8 (sudah include di base image)
+- **CUDA**: 12.4 (sudah include di base image)
 
 ### Cloud (RunPod)
 - **GPU Instance**: RTX 3080/3090, A4000, A5000, atau lebih tinggi
@@ -49,8 +49,8 @@ psycopg2-binary     # PostgreSQL driver
 ```
 
 ### CUDA Libraries
-- PyTorch 2.1.2 (CUDA 11.8)
-- torchvision 0.16.2
+- PyTorch 2.3.1 (CUDA 12.1)
+- torchvision 0.18.1
 
 ### System Libraries
 - libgl1 (OpenGL)
@@ -69,9 +69,6 @@ runpod-worker-image-upscaler/
 │   ├── service.py         # Database operations
 │   └── migrations/        # SQL migrations
 │       └── init.sql       # Initial schema
-├── models/                # Pre-trained models (bundled)
-│   ├── RealESRGAN_x2plus.pth
-│   └── RealESRGAN_x4plus.pth
 ├── Dockerfile             # Container definition
 ├── docker-compose.yml     # Local development setup
 ├── requirements.txt       # Python dependencies
@@ -161,17 +158,14 @@ Pastikan Anda sudah install:
 git clone <repository-url>
 cd runpod-worker-image-upscaler
 
-# Download model files (jika belum ada)
-# Letakkan file model di folder models/:
-# - RealESRGAN_x2plus.pth
-# - RealESRGAN_x4plus.pth
-
 # Copy environment template
 cp .env-example .env
 
 # Edit .env dengan konfigurasi Anda
 nano .env
 ```
+
+> **Note**: Model files tidak di-bundle di Docker image. Upload model ke RunPod Network Volume sebelum deploy (lihat [Network Volume Setup](#-network-volume-setup)).
 
 ### 3. Build Docker Image
 
@@ -205,11 +199,11 @@ docker build -t your-username/runpod-upscaler:latest .
    - Set worker count & max workers
    - Deploy endpoint
 
-4. **(Optional) Setup Network Volume**:
-   - Create Network Volume di RunPod (if using volume storage mode)
+4. **Setup Network Volume** (required untuk models):
+   - Create Network Volume di RunPod
    - Attach volume ke serverless endpoint
    - Mount path: `/runpod-volume`
-   - Upload models & input images ke volume
+   - Upload models ke `/runpod-volume/real-esrgan-models/` (lihat [Network Volume Setup](#-network-volume-setup))
 
 5. **Test via API**:
    ```bash
@@ -226,16 +220,16 @@ docker build -t your-username/runpod-upscaler:latest .
      }'
    ```
 
-## 📦 Network Volume Setup (Optional)
+## 📦 Network Volume Setup
 
-Network Volume memberikan persistent storage untuk models dan images.
+Network Volume **wajib** digunakan untuk menyimpan model files. Tanpa ini worker tidak bisa berjalan.
 
 ### Upload Models ke Network Volume
 
 ```bash
 # SSH ke RunPod Pod atau gunakan file manager
-mkdir -p /runpod-volume/models
-cd /runpod-volume/models
+mkdir -p /runpod-volume/real-esrgan-models
+cd /runpod-volume/real-esrgan-models
 
 # Download models
 wget https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth
@@ -255,9 +249,12 @@ scp -r /local/images/* user@pod:/runpod-volume/inputs/
 ### Environment Variables untuk Volume Mode
 
 ```env
-# Use models from network volume
-MODEL_2X_PATH=/runpod-volume/models/RealESRGAN_x2plus.pth
-MODEL_4X_PATH=/runpod-volume/models/RealESRGAN_x4plus.pth
+# Model directory di network volume (default)
+REAL_ESRGAN_HOME=/runpod-volume/real-esrgan-models
+
+# Override path per-model (opsional, jika berbeda dari REAL_ESRGAN_HOME)
+MODEL_2X_PATH=${REAL_ESRGAN_HOME}/RealESRGAN_x2plus.pth
+MODEL_4X_PATH=${REAL_ESRGAN_HOME}/RealESRGAN_x4plus.pth
 
 # Use volume for input/output
 INPUT_STORAGE_MODE=volume
@@ -265,11 +262,9 @@ OUTPUT_STORAGE_MODE=volume
 ```
 
 **Benefits**:
-- ✅ Smaller Docker image (~2GB vs ~10GB)
-- ✅ Faster cold starts
+- ✅ Faster cold starts (models tidak di-load ulang dari disk setiap job)
 - ✅ Update models without rebuilding image
 - ✅ Shared storage across workers
-   ```
 
 ## ⚙️ Configuration
 
@@ -332,10 +327,18 @@ WEBHOOK_TIMEOUT_SECONDS=10
 WEBHOOK_AUTH_TOKEN=your-secret-token          # Sent as Bearer token
 ```
 
-#### Model Paths (Optional)
+#### Model Paths
 ```env
-MODEL_2X_PATH=/models/RealESRGAN_x2plus.pth
-MODEL_4X_PATH=/models/RealESRGAN_x4plus.pth
+# Direktori model di network volume
+REAL_ESRGAN_HOME=/runpod-volume/real-esrgan-models
+
+# Override path per-model (opsional)
+MODEL_2X_PATH=${REAL_ESRGAN_HOME}/RealESRGAN_x2plus.pth
+MODEL_4X_PATH=${REAL_ESRGAN_HOME}/RealESRGAN_x4plus.pth
+
+# Tile size untuk memproses gambar besar (0 = no tiling, default)
+# Gunakan nilai seperti 512 atau 1024 untuk mengurangi VRAM usage
+UPSCALER_TILE_SIZE=0
 ```
 
 #### Logging (Optional)
@@ -600,8 +603,8 @@ curl -X POST https://api.runpod.ai/v2/YOUR_ENDPOINT_ID/runsync \
 - **RealESRGAN_x4plus.pth**: ~64 MB
 
 ### Docker Image Size
-- **Base size**: ~8 GB (includes CUDA, PyTorch)
-- **With models**: ~8.2 GB
+- **Base size**: ~8 GB (includes CUDA 12.4, PyTorch 2.3.1)
+- Models di-load dari Network Volume (tidak di-bundle di image)
 
 ### Output Format Comparison
 
@@ -626,24 +629,22 @@ curl -X POST https://api.runpod.ai/v2/YOUR_ENDPOINT_ID/runsync \
 
 ### Model file not found
 
-**Error**: `Model file not found: /models/RealESRGAN_x4plus.pth`
+**Error**: `Model file not found: /runpod-volume/real-esrgan-models/RealESRGAN_x4plus.pth`
 
 **Solution**:
-1. Pastikan file model ada di folder `models/`
-2. Rebuild Docker image: `docker compose build`
-3. Check Dockerfile: `COPY models/ /models/` ada
+1. Upload model ke Network Volume: `mkdir -p /runpod-volume/real-esrgan-models`
+2. Download model: `wget https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth`
+3. Pastikan Network Volume sudah di-attach ke endpoint dan env `REAL_ESRGAN_HOME` benar
 
 ### Torchvision warning
 
 **Warning**: `The torchvision.transforms.functional_tensor module is deprecated...`
 
-**Status**: ⚠️ Warning only (not critical)
+**Status**: ✅ Fixed
 
 **Explanation**:
-- Ini adalah deprecation warning dari dependency (basicsr/realesrgan)
-- Tidak mempengaruhi functionality
-- Will be fixed when dependencies update ke torchvision 0.17+
-- Safe to ignore untuk sekarang
+- Sudah di-patch otomatis di Dockerfile saat build
+- Tidak perlu tindakan apapun
 
 ### Out of memory (CUDA)
 
