@@ -370,6 +370,15 @@ def handler(job: dict) -> dict:
 
     # --- Validate input ---
     image_key: str | None = job_input.get("image")
+    if image_key == "warming-up":
+        logger.warning("Job %s rejected: warming up", runpod_job_id)
+        return _build_final_response(
+            {
+                "job_id": runpod_job_id,
+            },
+            status="warming-up",
+            webhook_enabled=False,
+        )
     if not image_key:
         logger.warning("Job %s rejected: missing image", runpod_job_id)
         return _respond(
@@ -574,7 +583,7 @@ def handler(job: dict) -> dict:
         "scale": scale
     }
 
-    return _respond(response_payload, status="success")
+    return _respond(response_payload, status="COMPLETED")
 
 
 if __name__ == "__main__":
