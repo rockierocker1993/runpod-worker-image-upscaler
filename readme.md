@@ -9,6 +9,7 @@ RunPod serverless worker untuk upscaling gambar menggunakan Real-ESRGAN dengan d
 - ✅ Upscale gambar 2x atau 4x menggunakan Real-ESRGAN
 - ✅ Multi-format output: PNG (lossless), JPG, WebP dengan quality control
 - ✅ Auto-delete input image setelah upscaling (opsional)
+- ✅ Warming-up worker tanpa memproses gambar (`image: "warming-up"`)
 - ✅ Simpan metadata ke database PostgreSQL (opsional)
 - ✅ Webhook callback async untuk notifikasi status (success/error)
 - ✅ Models di-load dari RunPod Network Volume
@@ -360,6 +361,15 @@ LOG_LEVEL=INFO                                 # DEBUG, INFO, WARNING, ERROR
 }
 ```
 
+#### Warming-Up Request
+```json
+{
+  "input": {
+    "image": "warming-up"
+  }
+}
+```
+
 #### Full Input
 ```json
 {
@@ -379,15 +389,18 @@ LOG_LEVEL=INFO                                 # DEBUG, INFO, WARNING, ERROR
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `input.image` | string | Yes | - | Image path/key (S3 key or volume path) |
+| `input.image` | string | Yes | - | Image path/key (S3 key or volume path), atau `"warming-up"` untuk warming-up |
 | `input.scale` | integer | No | 4 | Upscale factor (2 atau 4) |
 | `input.output_format` | string | No | `png` | Output format: `png`, `jpg`, `jpeg`, `webp` |
-| `input.output_quality` | integer | No | 95 | Quality untuk lossy formats (1-100) || `input.webhook_enabled` | boolean | No | `true` | Aktifkan/nonaktifkan webhook untuk job ini |
+| `input.output_quality` | integer | No | 95 | Quality untuk lossy formats (1-100) |
+| `input.webhook_enabled` | boolean | No | `true` | Aktifkan/nonaktifkan webhook untuk job ini |
 | `input.webhook_url` | string | No | - | Override `WEBHOOK_CALLBACK_URL` untuk job ini |
+
 **Notes**: 
 - `input.image` format tergantung storage mode:
   - S3 mode: `folder/image.jpg` (S3 object key)
   - Volume mode: `batch/image.jpg` (relative path dari INPUT_VOLUME_PATH)
+  - `"warming-up"` → special value untuk warming-up worker (tidak memproses gambar)
 - `output_quality` hanya berlaku untuk `jpg` dan `webp` (lossy formats)
 - PNG selalu lossless (quality diabaikan)
 
@@ -440,6 +453,15 @@ LOG_LEVEL=INFO                                 # DEBUG, INFO, WARNING, ERROR
 - `output_storage_mode`: Storage mode used for output (`cloudflare` or `volume`)
 - `output_url`: Public URL (only when `output_storage_mode=cloudflare`)
 - `output_volume`: File path in network volume (only when `output_storage_mode=volume`)
+
+#### Warming-Up Response
+```json
+{
+  "status": "warming-up",
+  "job_id": "job-12345",
+  "webhook_triggered_at": null
+}
+```
 
 #### Error Response
 ```json
@@ -519,7 +541,7 @@ docker compose exec app psql $DATABASE_URL -f db/migrations/init.sql
 - Response formatting
 
 **Key Functions**:
-- `handler(job)` - Main RunPod handler
+- `handler(job)` - Main RunPod handler (termasuk warming-up check)
 - `_download_image_from_s3()` - Download from S3
 - `_upload_to_cloudflare()` - Upload to Cloudflare Images
 - `_send_webhook_callback()` - Send webhook
