@@ -1,0 +1,15 @@
+.git
+**/.git
+**/.gitignore
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+.env
+.venv
+venv/
+*.md
+!README.md
+# Don't ship local model weights / inputs into the image
+models/
+inputs/
+outputs/
